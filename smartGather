@@ -1,0 +1,163 @@
+#!/bin/sh
+
+# (c) rjh - Aug 2009
+# licensed under the GPLv3 or later
+
+# run with --quiet if don't want to see the end summary
+
+# for dual-attached SATA or SAS disks running on Lustre servers
+
+addr=some_email_address
+mach=some_machine
+
+# for cexec via cron
+export PATH=${PATH}:/opt/c3-4/
+
+verbose=1
+if [ $# -gt 0 ]; then
+   verbose=0
+fi
+
+warnings() {
+   prefix="lustre"
+   for d in `seq 0 3`; do
+      cexec -p ${prefix}: "if [ \`/opt/lustre/bin/sasDisksOnPort $d | wc -w\` -ne 24 ]; then echo not 24 disks on port $d; fi" | grep -v ':$' | sed s/^$prefix/WARNING/
+   done
+}
+
+warnings > /tmp/warn.$$
+
+if [ $verbose -eq 1 ]; then
+   cat /tmp/warn.$$
+fi
+
+prefix="lustre"
+
+for f in `seq 1 30`; do
+   let i=$f%2
+   if [ $i -eq 1 ]; then  # odd hosts
+       cexec ${prefix}:$f 'p=0; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' > /tmp/smart.$f.0.$$ &
+       cexec ${prefix}:$f 'p=1; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' > /tmp/smart.$f.1.$$ &
+   else  # even hosts
+       cexec ${prefix}:$f 'p=2; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' > /tmp/smart.$f.2.$$ &
+       cexec ${prefix}:$f 'p=3; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' > /tmp/smart.$f.3.$$ &
+   fi
+done
+wait
+
+# do both views to the disk as disk might be only visible to one
+for f in `seq 1 30`; do
+   let i=$f%2
+   if [ $i -eq 0 ]; then  # even hosts
+       cexec ${prefix}:$f 'p=0; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' >> /tmp/smart.$f.0.$$ &
+       cexec ${prefix}:$f 'p=1; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' >> /tmp/smart.$f.1.$$ &
+   else  # odd hosts
+       cexec ${prefix}:$f 'p=2; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' >> /tmp/smart.$f.2.$$ &
+       cexec ${prefix}:$f 'p=3; d=0; for f in `/opt/lustre/bin/sasDisksOnPort $p`; do g=`/opt/lustre/bin/sdToSg $f`; echo `hostname` $f $g port $p disk $d; smartctl -a $f; let d=d+1; done' >> /tmp/smart.$f.3.$$ &
+   fi
+done
+wait
+
+
+file=$HOME/smart/smart."`date +'%F-%T'`"
+if [ $verbose -eq 1 ]; then
+   echo $file
+fi
+
+touch $file.summary
+
+cat /tmp/warn.$$ > $file
+rm /tmp/warn.$$
+
+# sata
+# port 0,1,2,3 hamster25,26 and port 3 in hamster23,24 are hitachi, the rest are seagate
+for type in seagate hitachi; do
+   rm -f $file
+   if [ $type = "seagate" ]; then
+      for f in `seq 1 22` 31 32 98 99; do
+         for p in `seq 0 3`; do
+            if [ -e /tmp/smart.$f.$p.$$ ]; then
+               cat /tmp/smart.$f.$p.$$ >> $file
+            fi
+         done
+      done
+      for f in 23 24; do
+         for p in 0 1; do
+            if [ -e /tmp/smart.$f.$p.$$ ]; then
+               cat /tmp/smart.$f.$p.$$ >> $file
+            fi
+         done
+      done
+   elif [ $type = "hitachi" ]; then
+      for f in 23 24; do
+         for p in 2 3; do
+            if [ -e /tmp/smart.$f.$p.$$ ]; then
+               cat /tmp/smart.$f.$p.$$ >> $file
+            fi
+         done
+      done
+      for f in 25 26; do
+         for p in `seq 0 3`; do
+            if [ -e /tmp/smart.$f.$p.$$ ]; then
+               cat /tmp/smart.$f.$p.$$ >> $file
+            fi
+         done
+      done
+   else
+      echo unknown type loop
+      exit 1
+   fi
+
+   # check all same fw and all same model on the hitachi group and the seagate group
+   if [ "`grep odel $file | awk '{print $1,$2,$3,$4}' | sort | uniq -c | wc -l`" != 1 ]; then
+      echo ERROR - not all disks the same model >> $file.summary
+      grep odel $file | awk '{print $1,$2,$3,$4}' | sort | uniq -c >> $file.summary
+   fi
+   if [ "`grep Firmw $file | sort | uniq -c | wc -l`" != 1 ]; then
+      echo ERROR - not all SATA disks the same firmware version >> $file.summary
+      grep Firmw $file | sort | uniq -c >> $file.summary
+   fi
+done
+
+rm -f $file
+for f in `seq 1 30` 31 32 98 99; do
+   for p in `seq 0 3`; do
+      if [ -e /tmp/smart.$f.$p.$$ ]; then
+         cat /tmp/smart.$f.$p.$$ >> $file
+         rm /tmp/smart.$f.$p.$$
+      fi
+   done
+done
+
+# sas
+if [ "`grep Device: $file | wc -l`" != 0 ]; then   # if have any sas...
+   if [ "`grep Device: $file | sort | uniq -c | wc -l`" != 1 ]; then
+      echo ERROR - not all SAS disks the same model/firmware version >> $file.summary
+      grep Device: $file | sort | uniq -c >> $file.summary
+   fi
+fi
+
+
+cp $file.summary $file.errs
+
+cat $file | $HOME/smart/smartFormat.py blah >> $file.errs
+if [ -s $file.errs ]; then
+   if [ $verbose -eq 0 ]; then
+      /bin/mail -s "$mach disk errors" $addr -- -f $addr < $file.errs
+   else
+      echo ==================
+      echo ERRORS
+      echo ==================
+      cat $file.errs
+      echo ==================
+   fi
+else
+   rm $file.errs
+fi
+
+cat $file | $HOME/smart/smartFormat.py >> $file.summary
+if [ $verbose -eq 1 ]; then
+   cat $file.summary
+fi
+
+gzip $file
